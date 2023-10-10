@@ -15,11 +15,17 @@ type Message struct {
 	message string
 }
 
-func handleError(err error) {
-	if err == io.EOF {
-		fmt.Println("Client disconnected :(")
+func handleError(err error, clientid int) {
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		fmt.Printf("Error with client %d: Connection timed out.\n", clientid)
+	} else if opErr, ok := err.(*net.OpError); ok {
+		if opErr.Op == "read" {
+			fmt.Printf("Error with client %d: Connection was reset by peer.\n", clientid)
+		} else if opErr.Op == "write" {
+			fmt.Printf("Error with client %d: Failed to write data.\n", clientid)
+		}
 	} else {
-		fmt.Printf("Error occurred: %s\n", err)
+		fmt.Printf("Error with client %d: %s\n", clientid, err)
 	}
 }
 
@@ -28,12 +34,14 @@ func acceptConns(ln net.Listener, conns chan net.Conn) {
 	// Continuously accept a network connection from the Listener
 	// and add it to the channel for handling connections.
 
-	conn, err := ln.Accept()
-	if err != nil {
-		fmt.Println("Error accepting connection:", err)
-		return
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			fmt.Println("Error accepting connection:", err)
+			continue // If there's an error, skip the rest of the loop and try to accept the next connection.
+		}
+		conns <- conn
 	}
-	conns <- conn
 }
 
 func handleClient(client net.Conn, clientid int, msgs chan Message) {
@@ -46,9 +54,21 @@ func handleClient(client net.Conn, clientid int, msgs chan Message) {
 	for {
 		message, err := reader.ReadString('\n')
 		if err != nil {
-			handleError(err)
+			// Handling the EOF error separately as it's a common and expected case
+			if err == io.EOF {
+				fmt.Printf("Client %d disconnected :(\n", clientid)
+			} else {
+				handleError(err, clientid)
+			}
 			return
 		}
+
+		// Check for exit command
+		if strings.TrimSpace(message) == "exit" {
+			fmt.Printf("Client %d exited\n", clientid)
+			return
+		}
+
 		// Tidy up each message (trimming newline and spaces)
 		tidyMessage := strings.TrimSpace(message)
 
@@ -60,6 +80,14 @@ func handleClient(client net.Conn, clientid int, msgs chan Message) {
 
 		// Send this Message to the msgs channel
 		msgs <- msg
+
+		// Sending acknowledgment back to the client
+		reply := tidyMessage + "\n"
+		_, err = client.Write([]byte(reply))
+		if err != nil {
+			handleError(err, clientid)
+			return
+		}
 	}
 }
 
@@ -88,6 +116,7 @@ func main() {
 
 	//Start accepting connections
 	go acceptConns(ln, conns)
+
 	for {
 		select {
 		case conn := <-conns:
